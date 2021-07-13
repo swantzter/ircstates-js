@@ -46,6 +46,16 @@ export class Server extends EventEmitter {
     this.on('TAGMSG', this.handleMessage)
     this.on(Numeric.RPL_VISIBLEHOST, this.handleVisiblehost)
     this.on(Numeric.RPL_WHOREPLY, this.handleWho)
+    this.on(Numeric.RPL_WHOISUSER, this.handleWhoisUser)
+    this.on('CHGHOST', this.handleChghost)
+    this.on('SETNAME', this.handleSetname)
+    this.on('RENAME', this.handleRename)
+    this.on(Numeric.RPL_AWAY, this.handleAwayNum)
+    this.on('AWAY', this.handleAway)
+    this.on('ACCOUNT', this.handleAccount)
+    this.on('CAP', this.handleCap)
+    this.on(Numeric.RPL_LOGGEDIN, this.handleLoggedin)
+    this.on(Numeric.RPL_LOGGEDOUT, this.handleLoggedout)
   }
 
   nickname = ''
@@ -70,9 +80,9 @@ export class Server extends EventEmitter {
   isupport = new ISupport()
 
   hasCap = false
-  #tempCaps: Record<string, string> = {}
-  availableCaps: Record<string, string> = {}
-  agreedCaps: string[] = []
+  #tempCaps: Map<string, string> = new Map()
+  availableCaps: Map<string, string> = new Map()
+  agreedCaps: Set<string> = new Set()
 
   recv (data: Uint8Array) {
     const lines = this.#decoder.push(data)
@@ -133,7 +143,7 @@ export class Server extends EventEmitter {
     return new Line({ command: 'WHO', params: [target, `n%afhinrstu,${WHO_TYPE}`] })
   }
 
-  private selfHostmask (hostmask: Hostmask) {
+  private thisHostmask (hostmask: Hostmask) {
     this.nickname = hostmask.nickname
     if (hostmask.username) this.username = hostmask.username
     if (hostmask.hostname) this.hostname = hostmask.hostname
@@ -211,7 +221,7 @@ export class Server extends EventEmitter {
         this.channels.set(channelLower, channel)
       }
 
-      this.selfHostmask(line.hostmask)
+      this.thisHostmask(line.hostmask)
       if (extended) {
         this.account = account
         this.realname = realname
@@ -318,7 +328,7 @@ export class Server extends EventEmitter {
         if (hm.username) user.username = hm.username
         if (hm.hostname) user.hostname = hm.hostname
 
-        if (this.isMe(nicknameLower)) this.selfHostmask(hm)
+        if (this.isMe(nicknameLower)) this.thisHostmask(hm)
 
         for (const mode of modes) {
           if (!channelUser.modes.has(mode)) channelUser.modes.add(mode)
@@ -505,7 +515,7 @@ export class Server extends EventEmitter {
   private handleMessage (line: Line) {
     if (!line.source) return undefined
     // const message = line.params[1]
-    if (this.isMe(line.hostmask.nickname)) this.selfHostmask(line.hostmask)
+    if (this.isMe(line.hostmask.nickname)) this.thisHostmask(line.hostmask)
 
     let user = this.getUser(line.hostmask.nickname)
     if (!user) user = new User(new Name(line.hostmask.nickname, this.casefold(line.hostmask.nickname)))
@@ -563,5 +573,197 @@ export class Server extends EventEmitter {
       user.server = server
       user.away = away
     }
+  }
+
+  private handleWhox ({ params }: Line) {
+    if (params[1] !== WHO_TYPE || params.length !== 10) return
+
+    const nickname = params[6]
+    const username = params[2]
+    const hostname = params[4]
+    const status = params[7]
+    const away = status.includes('G') ? '' : undefined
+    const realname = params[9]
+    const account = params[8] === '0' ? '' : params[8]
+    const server = params[5] === '*' ? undefined : params[5]
+
+    let ip: string | undefined
+    if (params[3] !== '255.255.255.255') {
+      // TODO: handle IP
+    }
+
+    const user = this.getUser(nickname)
+    if (user) {
+      user.username = username
+      user.hostname = hostname
+      user.realname = realname
+      user.account = account
+      user.server = server
+      user.away = away
+      user.ip = ip
+    }
+
+    if (this.isMe(nickname)) {
+      this.username = username
+      this.hostname = hostname
+      this.realname = realname
+      this.account = account
+      this.server = server
+      this.away = away
+      this.ip = ip
+    }
+  }
+
+  // WHOIS "user" line, one of "WHOIS nickname" response lines
+  private handleWhoisUser ({ params }: Line) {
+    const nickname = params[1]
+    const username = params[2]
+    const hostname = params[3]
+    const realname = params[5]
+
+    const user = this.getUser(username)
+    if (user) {
+      user.username = username
+      user.hostname = hostname
+      user.realname = realname
+    }
+
+    if (this.isMe(nickname)) {
+      this.username = username
+      this.hostname = hostname
+      this.realname = realname
+    }
+  }
+
+  private handleChghost ({ params, hostmask }: Line) {
+    const username = params[0]
+    const hostname = params[1]
+
+    const user = this.getUser(hostmask.nickname)
+    if (user) {
+      user.username = username
+      user.hostname = hostname
+    }
+
+    if (this.isMe(hostmask.nickname)) {
+      this.username = username
+      this.hostname = hostname
+    }
+  }
+
+  private handleSetname ({ params, hostmask }: Line) {
+    const realname = params[0]
+
+    const user = this.getUser(hostmask.nickname)
+    if (user) user.realname = realname
+
+    if (this.isMe(hostmask.nickname)) this.realname = realname
+  }
+
+  private handleRename ({ params }: Line) {
+    const sourceFold = this.casefold(params[0])
+    const rename = params[1]
+    const renameFold = this.casefold(rename)
+
+    const channel = this.getChannel(sourceFold)
+    if (channel) {
+      channel.changeName(rename, renameFold)
+      for (const [nickname] of channel.users) {
+        const user = this.getUser(nickname)
+        if (!user) continue
+        user.channels.delete(sourceFold)
+        user.channels.add(sourceFold)
+      }
+
+      this.channels.delete(sourceFold)
+      this.channels.set(renameFold, channel)
+    }
+  }
+
+  private handleAwayNum ({ params }: Line) {
+    const nickname = params[1]
+    const reason = params[2]
+
+    const user = this.getUser(nickname)
+    if (user) user.away = reason
+    if (this.isMe(nickname)) this.away = reason
+  }
+
+  private handleAway ({ params, hostmask }: Line) {
+    const away = params[0]
+
+    const user = this.getUser(hostmask.nickname)
+    if (user) user.away = away
+    if (this.isMe(hostmask.nickname)) this.away = away
+  }
+
+  private handleAccount ({ params, hostmask }: Line) {
+    const account = params[0].replace(/(^\*+|\*+$)/g, '')
+
+    const user = this.getUser(hostmask.nickname)
+    if (user) user.account = account
+    if (this.isMe(hostmask.nickname)) this.account = account
+  }
+
+  private handleCap ({ params }: Line) {
+    this.hasCap = true
+    const subcommand = params[1].toLocaleUpperCase()
+    const multiline = params[2] === '*'
+    const caps = params[2 + (multiline ? 1 : 0)]
+
+    const tokens: Map<string, string> = new Map()
+    const tokensStr: string[] = [] // TODO: used?
+
+    for (const cap of caps.split(' ').filter(c => !!c)) {
+      tokensStr.push(cap)
+      const [key, val] = cap.split(/=(.*)/)
+      tokens.set(key, val)
+    }
+
+    switch (subcommand) {
+      case 'LS': {
+        this.#tempCaps = new Map([...this.#tempCaps, ...tokens])
+        if (!multiline) {
+          this.availableCaps = new Map(this.#tempCaps)
+          this.#tempCaps.clear()
+        }
+        break
+      }
+      case 'NEW':
+        this.availableCaps = new Map([...this.availableCaps, ...tokens])
+        break
+      case 'DEL': {
+        for (const [key] of tokens) {
+          this.availableCaps.delete(key)
+          this.agreedCaps.delete(key)
+        }
+        break
+      }
+      case 'ACK': {
+        for (let [key] of tokens) {
+          if (key.startsWith('-')) {
+            key = key.substring(1)
+            this.agreedCaps.delete(key)
+          } else if (this.availableCaps.has(key)) {
+            this.agreedCaps.add(key)
+          }
+        }
+      }
+    }
+  }
+
+  private handleLoggedin ({ params }: Line) {
+    const hm = hostmask(params[1])
+    const account = params[2]
+
+    this.account = account
+    this.thisHostmask(hm)
+  }
+
+  private handleLoggedout ({ params }: Line) {
+    const hm = hostmask(params[1])
+
+    this.account = undefined
+    this.thisHostmask(hm)
   }
 }
